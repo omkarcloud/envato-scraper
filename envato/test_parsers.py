@@ -15,6 +15,7 @@ from schema_fields import load_query
 from envato import parsers_elements as E
 from envato import parsers_market as P
 from envato import refs, schemas
+from scraper_utils.testing import hosted_only
 
 FX = os.path.join(os.path.dirname(__file__), "fixtures")
 TF = "https://themeforest.net"
@@ -198,3 +199,40 @@ def test_partial_input_never_crashes():
     assert E.item_page({})["id"] is None
     assert E.search_page({}, 1)["items"] == []
     assert E.item_card({"id": "X", "video": "oops", "musicVariants": []})["id"] == "X"
+
+
+class _FakeBox:
+    """browser_client.fetch_any stand-in: records every candidate list and
+    answers from the candidate `picks` names, raising BoxRefused on the
+    picks given as ("refuse", i)."""
+    def __init__(self, picks):
+        self.picks, self.offered, self.sessions, self.calls = list(picks), [], [], []
+
+    def __call__(self, site, candidates, **kw):
+        import browser_client
+        self.calls.append(site)
+        self.offered.append([p for p, _s in candidates])
+        self.sessions.append([s for _p, s in candidates])
+        pick = self.picks.pop(0)
+        if isinstance(pick, tuple):
+            raise browser_client.BoxRefused("refused", candidate=pick[1])
+        return pick, {"status": 200, "body": f"from-browser-{pick}", "final_url": kw.get("url")}
+
+
+@hosted_only
+def test_box_fetch_offers_burst_sessions_on_the_hosts_exit(monkeypatch):
+    import config
+    import browser_client
+    from envato import fetch
+    monkeypatch.setattr(config, "INPAGE_BROWSER_SLOTS", 2)
+    monkeypatch.setattr(config, "BROWSER_BURST_FACTOR", 4)
+    box = _FakeBox([0, 3, 0])
+    monkeypatch.setattr(browser_client, "fetch_any", box)
+    ident = fetch._Identity("themeforest.net", "browser", {}, "ua", "http://u:p@gw:10007", 1)
+    r = fetch._box_fetch(ident, "https://themeforest.net/search?x", {"accept": "text/html"})
+    assert r.status_code == 200 and r.text == "from-browser-0"
+    assert fetch._box_fetch(ident, "https://themeforest.net/search?y", {}).text == "from-browser-3"
+    assert box.calls == [fetch.BOX_FETCH] * 2
+    assert box.offered[0] == ["http://u:p@gw:10007"] * 8                             # all on the host's exit
+    assert box.sessions[0] == [f"themeforest.net@p10007#{i}" for i in range(8)]
+    assert box.sessions[1] == box.sessions[0]

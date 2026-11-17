@@ -20,7 +20,7 @@ Surfaces (all verified 2026-09-21 on the seven marketplaces):
   user rows       ".user-list > li" (followers, following, top authors, new authors)
   category tree   the nested ".category-section" lists on /category
 """
-import json
+import fastjson
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -184,7 +184,7 @@ def ld_json(doc):
     out = {}
     for tag in doc.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(tag.string or "")
+            data = fastjson.loads(tag.string or "")
         except (TypeError, ValueError):
             continue
         for obj in data if isinstance(data, list) else [data]:

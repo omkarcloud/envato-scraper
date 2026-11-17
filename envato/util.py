@@ -1,49 +1,16 @@
 """Small value / HTML helpers shared by the Envato modules. Kept inside the
-package (not imported from another site's package) so envato/ stands alone —
-the open-source kit ships it verbatim."""
+package or taken from scraper_utils, never imported from another site's
+package: the open-source kit ships both verbatim."""
 import html as html_lib
-import random
 import re
 from datetime import datetime, timezone
 
 from bs4 import BeautifulSoup
+from scraper_utils.values import num as to_float, to_int
+from scraper_utils.text import stripped as text
+from scraper_utils.dates import iso_utc as iso_datetime
 
 _COUNT_RE = re.compile(r"([\d.,]+)\s*([KkMm]?)")
-
-
-def to_int(value):
-    try:
-        return int(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def to_float(value):
-    try:
-        return float(value) if value not in (None, "") else None
-    except (TypeError, ValueError):
-        return None
-
-
-def text(value):
-    """Trimmed string or None ('' / whitespace -> None)."""
-    if not isinstance(value, str):
-        return None
-    value = value.strip()
-    return value or None
-
-
-def iso_datetime(value):
-    """'2023-05-17T14:41:20.302Z' -> '2023-05-17T14:41:20Z' (UTC); junk -> None."""
-    if not value or not isinstance(value, str):
-        return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def soup(markup):
@@ -78,27 +45,3 @@ def count(value):
     elif suffix == "m":
         amount *= 1_000_000
     return int(round(amount))
-
-
-def click_turnstile(page):
-    """Real mouse click on a Cloudflare Turnstile checkbox: the widget
-    iframe's bounding box, x at 1/9 of the width (the checkbox), y at the
-    middle. Returns True when a challenge frame was found and clicked."""
-    for frame in page.frames:
-        if not frame.url.startswith("https://challenges.cloudflare.com"):
-            continue
-        try:
-            box = frame.frame_element().bounding_box()
-        except Exception:
-            box = None
-        if not box or box.get("width", 0) < 50:
-            continue
-        x = box["x"] + box["width"] / 9 + random.uniform(-5, 5)
-        y = box["y"] + box["height"] / 2 + random.uniform(-5, 5)
-        page.mouse.move(x, y, steps=random.randint(10, 25))
-        page.wait_for_timeout(random.randint(100, 300))
-        page.mouse.down()
-        page.wait_for_timeout(random.randint(50, 150))
-        page.mouse.up()
-        return True
-    return False

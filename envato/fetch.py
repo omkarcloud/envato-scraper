@@ -6,16 +6,19 @@ audiojungle.net, graphicriver.net, photodune.net, 3docean.net
   route, /storefront/search_suggestions. EVERY path on these hosts — pages,
   feeds, robots.txt, the JSON route — answers a Cloudflare managed challenge
   (403 + `cf-mitigated: challenge`) to plain curl on every egress tried:
-  direct, US / IN residential and datacenter proxies. A HEADED patchright
-  Chrome clears it without a click (2-4 s from a home IP, ~14 s through a US
-  residential exit); headless never clears. The browser's cf_clearance + __cf_bm
-  cookies and its user-agent then replay over curl_cffi from the same exit,
-  for every path of that host. cf_clearance is bound to a HOST (the
-  themeforest cookie is 403 on codecanyon), so identities are kept per host:
-  minted lazily on the host's first request, shared by every worker thread,
-  re-minted when a replay is challenged again. A failed mint backs off for
-  config.ENVATO_MARKET_HARVEST_COOLDOWN seconds instead of relaunching
-  Chrome per request.
+  direct, US / IN residential and datacenter proxies. A HEADED Chrome
+  clears it without a click (2-4 s from a home IP, ~14 s through a US
+  residential exit); headless never clears. Since 2026-10-22 that Chrome
+  runs on the browser box (browser_client.mint("envato", variant=<host>) ->
+  recipes/envato.py) through the sticky US residential port this pod
+  replays on. The browser's cf_clearance + __cf_bm cookies and its
+  user-agent then replay over curl_cffi from the same exit, for every path
+  of that host. cf_clearance is bound to a HOST (the themeforest cookie is
+  403 on codecanyon), so identities are kept per host: minted lazily on the
+  host's first request, shared by every worker thread, re-minted when a
+  replay is challenged again. A failed mint backs off for
+  config.ENVATO_MARKET_HARVEST_COOLDOWN seconds instead of minting per
+  request.
 
 ENVATO ELEMENTS — elements.envato.com
   A React app whose every page is hydrated from one JSON route:
@@ -26,8 +29,9 @@ ENVATO ELEMENTS — elements.envato.com
   so: direct first, then the last good residential exit and fresh ones
   (config.ENVATO_ELEMENTS_PROXY_COUNTRY) up to
   config.ENVATO_ELEMENTS_ROTATE_ATTEMPTS, one more round after a backoff,
-  and finally the shared browser's elements.envato.com tab (the Market
-  machinery below) when config.ENVATO_ELEMENTS_BROWSER_FALLBACK is on.
+  and finally an elements.envato.com identity on the box (the Market
+  machinery below, variant "elements.envato.com") when
+  config.ENVATO_ELEMENTS_BROWSER_FALLBACK is on.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   EnvatoUpstreamError  transport failure / 5xx                — retried
@@ -36,6 +40,7 @@ Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   EnvatoNotFound       404 / unknown item or author            — never retried
 """
 import json
+import fastjson
 import os
 import sys
 import threading
@@ -45,30 +50,32 @@ from urllib.parse import quote, urlencode, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import browser_client
 import config
+import egress
+from browser_client import BoxRefused, BoxUnavailable
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, sessions as sessions_utils
 
 IMPERSONATE = "chrome"
 TIMEOUT = 40
 FANOUT_WORKERS = 8
 ELEMENTS = "https://elements.envato.com"
 DATA_API = ELEMENTS + "/data-api/page/page"
+BOX_SITE = "envato"                # recipes/envato.py (per-host mint)
+BOX_FETCH = "envato-fetch"         # recipes/envato_fetch.py (browser mode, per host)
 
 CF_MARKERS = ("just a moment", "cf-chl", "challenge-platform", "cf_chl_opt",
               "performing security verification", "attention required! | cloudflare")
-HARVEST_POLL = 0.5
-HARVEST_SETTLE = 1.5
-CLICK_EVERY = 10
-MAX_CLICKS = 3
-HARVEST_SEED = "/"
+HARVEST_SEED = "/"                 # the page the box mints on and the curl validation replays
 
 HTML_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("envato"),
 }
 JSON_HEADERS = {
     "accept": "application/json, text/plain, */*",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("envato"),
 }
 
 
@@ -90,14 +97,7 @@ class EnvatoNotFound(NotFound):
 
 def dump_debug(name, text):
     """Write a raw response to $ENVATO_DEBUG_DIR/<name>.html."""
-    dbg = os.environ.get("ENVATO_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".html"), "w") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("ENVATO_DEBUG_DIR", name, text, ext=".html")
 
 
 def looks_blocked(resp):
@@ -111,37 +111,34 @@ def looks_blocked(resp):
 
 
 def _new_session(proxy):
-    from curl_cffi import requests as curl_requests
-    sess = curl_requests.Session(impersonate=IMPERSONATE)
-    if proxy:
-        sess.proxies = {"http": proxy, "https": proxy}
-    return sess
+    return sessions_utils.curl_session(IMPERSONATE, proxy)
 
 
 def _close(sess):
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions_utils.close_quietly(sess)
 
 
 # ======================================================================================
-# Envato Market: one shared headed Chrome, one tab per marketplace host
+# Envato Market: per-host identities minted on the browser box
 # ======================================================================================
 # Cloudflare treats the seven hosts independently, and by exit IP:
-#   * a CHALLENGED exit shows a Turnstile page; clicking it earns a
+#   * a CHALLENGED exit shows a Turnstile page; clearing it earns a
 #     cf_clearance whose cookies + UA replay over curl_cffi from the same exit
 #     ("curl" mode: parallel, ~1 s per page);
 #   * an UNCHALLENGED exit shows the real page straight away but issues no
 #     cf_clearance, and curl_cffi (any fingerprint, with or without the
 #     browser's cookies and UA) is still 403 there — while the same page's
-#     own fetch() answers 200. Those hosts are served by an in-page fetch()
-#     from their tab ("browser" mode, serialised on the browser's thread).
+#     own fetch() answers 200. Those hosts are served by in-page fetches from
+#     a kept browser on the box sitting on that host ("browser" mode:
+#     browser_client.fetch("envato-fetch", variant=<host>), one browser per
+#     host x port on the box, closed there after 300 s idle).
 # Both happen on the same host from different exits (verified 2026-09-21), so
-# the mode is decided per host at mint time by a curl replay of the page the
-# tab just loaded. The Chrome is launched on the first Market request and
-# closed after config.ENVATO_MARKET_BROWSER_IDLE seconds without one.
+# the mode is decided per host at mint time by a curl replay of the host's
+# home page. Every host mints and replays through ONE sticky US residential
+# port (_market_proxy, as the one shared Chrome's proxy was); a mint that
+# fails, or a browser-mode answer the box refuses, moves later mints to a
+# fresh port. Identities on the old port keep working until they are
+# challenged. No browser runs on GKE since 2026-10-22.
 
 class _Identity:
     __slots__ = ("host", "mode", "cookies", "ua", "proxy", "version")
@@ -158,155 +155,16 @@ class _Resp:
         self.status_code, self.text, self.headers, self.url = status_code, text, headers or {}, url
 
     def json(self):
-        return json.loads(self.text)
+        return fastjson.loads(self.text)
 
 
-class _MarketBrowser:
-    """The shared headed Chrome. Every playwright call runs on the driver's
-    owner thread through driver.call(); tab Page objects never leave it."""
-
-    def __init__(self):
-        self.lock = threading.RLock()
-        self.driver = None
-        self.proxy = None
-        self.generation = 0
-        self.tabs = {}              # host -> playwright Page (owner-thread only)
-        self.last_used = 0.0
-        self._reaper = None
-
-    # ---- lifecycle ---------------------------------------------------------------
-    def _launch(self):
-        from chrome_manager import create_scope
-        from patchright_driver import PatchrightDriver
-        self._close_locked()
-        proxy = config.envato_proxy(config.ENVATO_MARKET_PROXY_COUNTRY)
-        print(f"envato: launching the Market browser "
-              f"(proxy={'direct' if not proxy else proxy.rsplit('@', 1)[-1]})")
-        with create_scope():
-            self.driver = PatchrightDriver(proxy_url=proxy, headless=False)
-        self.proxy = proxy
-        self.generation += 1
-        self.tabs = {}
-        if self._reaper is None:
-            self._reaper = threading.Thread(target=self._reap, name="envato-browser-reaper", daemon=True)
-            self._reaper.start()
-
-    def _close_locked(self):
-        driver, self.driver, self.tabs = self.driver, None, {}
-        if driver is not None:
-            try:
-                driver.close()
-            except Exception:
-                pass
-
-    def restart(self, generation):
-        """Relaunch on a fresh exit unless another thread already did."""
-        with self.lock:
-            if self.generation == generation:
-                self._close_locked()
-
-    def _reap(self):
-        while True:
-            time.sleep(30)
-            with self.lock:
-                if self.driver is not None and time.time() - self.last_used > config.ENVATO_MARKET_BROWSER_IDLE:
-                    print("envato: closing the idle Market browser")
-                    self._close_locked()
-                    _drop_browser_identities()
-
-    def _driver(self):
-        with self.lock:
-            if self.driver is None:
-                self._launch()
-            self.last_used = time.time()
-            return self.driver, self.generation
-
-    # ---- tabs --------------------------------------------------------------------
-    def open_host(self, host):
-        """Load https://<host>/ in the host's tab until the real page shows
-        (clicking a Turnstile checkbox when one appears). Returns (cookies,
-        ua, proxy, generation). Raises RuntimeError when it never clears."""
-        from envato.util import click_turnstile as _click_turnstile
-
-        driver, generation = self._driver()
-        base = f"https://{host}"
-        tabs = self.tabs
-
-        def goto(page):
-            tab = tabs.get(host)
-            if tab is None or tab.is_closed():
-                tab = page if not tabs and page.url in ("about:blank", "") else page.context.new_page()
-                tabs[host] = tab
-            tab.goto(base + HARVEST_SEED, referer="https://www.google.com/",
-                     wait_until="domcontentloaded", timeout=60000)
-
-        def state(page):
-            tab = tabs[host]
-            return tab.title() or "", tab.url
-
-        def click(page):
-            return _click_turnstile(tabs[host])
-
-        started = time.monotonic()
-        driver.call(goto)
-        clicks, last_click = 0, None
-        while True:
-            title, _ = driver.call(state)
-            low = title.lower()
-            if low and not any(m in low for m in CF_MARKERS):
-                time.sleep(HARVEST_SETTLE)
-                break
-            elapsed = time.monotonic() - started
-            if elapsed > config.ENVATO_MARKET_HARVEST_TIMEOUT:
-                raise RuntimeError(f"Cloudflare challenge on {host} did not clear (clicks={clicks})")
-            due = (last_click is None and elapsed >= 4) or \
-                  (last_click is not None and time.monotonic() - last_click >= CLICK_EVERY)
-            if due and clicks < MAX_CLICKS and driver.call(click):
-                clicks += 1
-                last_click = time.monotonic()
-            time.sleep(HARVEST_POLL)
-        ua = driver.evaluate("navigator.userAgent")
-        cookies = {c["name"]: c["value"] for c in driver.call(lambda page: page.context.cookies(base))}
-        print(f"envato: {host} tab ready in {time.monotonic() - started:.0f}s "
-              f"(clicks={clicks}, cf_clearance={'cf_clearance' in cookies})")
-        return cookies, ua, self.proxy, generation
-
-    def fetch(self, host, url, headers, generation):
-        """In-page fetch() from the host's tab -> _Resp (status 0 = transport error)."""
-        from patchright_driver import _FETCH_JS, FETCH_TIMEOUT_MS
-        with self.lock:
-            if self.driver is None or self.generation != generation:
-                raise _StaleBrowser()
-            driver = self.driver
-            self.last_used = time.time()
-        tabs = self.tabs
-
-        def op(page):
-            tab = tabs.get(host)
-            if tab is None or tab.is_closed():
-                return None
-            return tab.evaluate(_FETCH_JS, {"url": url, "method": "GET", "headers": headers,
-                                            "body": None, "referrer": None,
-                                            "timeoutMs": FETCH_TIMEOUT_MS})
-        res = driver.call(op)
-        if res is None:
-            raise _StaleBrowser()
-        if not res.get("ok"):
-            raise EnvatoUpstreamError(f"in-page fetch failed: {res.get('error')}")
-        return _Resp(int(res.get("status") or 0), res.get("body") or "", res.get("headers"), res.get("url") or url)
-
-
-class _StaleBrowser(Exception):
-    """The browser (or the host's tab) this identity used is gone."""
-
-
-_browser = _MarketBrowser()
 _identities = {}               # host -> _Identity
 _host_locks = {}               # host -> Lock (one mint per host at a time)
 _failed_until = {}             # host -> epoch seconds
 _versions = {}                 # host -> int (bumps on every mint)
 _registry_lock = threading.Lock()
 _local = threading.local()     # per-thread curl sessions keyed by host
+_MARKET_EXITS = browser_client.ExitPool("envato", lambda: config.envato_proxy(config.ENVATO_MARKET_PROXY_COUNTRY))
 
 
 def _host_lock(host):
@@ -314,10 +172,63 @@ def _host_lock(host):
         return _host_locks.setdefault(host, threading.Lock())
 
 
-def _drop_browser_identities():
-    with _registry_lock:
-        for host in [h for h, i in _identities.items() if i.mode == "browser"]:
-            _identities.pop(host, None)
+def _egress(proxy):
+    return "direct" if not proxy else proxy.rsplit("@", 1)[-1]
+
+
+def _market_proxy_url(rotate=False):
+    """The sticky Market exit (config.ENVATO_MARKET_PROXY_COUNTRY; None =
+    direct), picked on first use and replaced on `rotate`."""
+    if rotate:
+        cur = _MARKET_EXITS.current()
+        if cur:
+            _MARKET_EXITS.rotate(cur[0])
+    return _MARKET_EXITS.get()
+
+
+def _box_mint(host, proxy):
+    """One mint on the browser box (recipes/envato.py, variant = host): a
+    throwaway headed Chrome loads https://<host>/ through `proxy` until the
+    real page shows -> (cookies, ua). RuntimeError when the box could not
+    open the host on this exit; EnvatoUpstreamError when the box is down."""
+    try:
+        ident = browser_client.mint(BOX_SITE, proxy=proxy, variant=host)
+    except BoxRefused as e:
+        raise RuntimeError(f"the box could not open {host} on this exit: {e}")
+    except BoxUnavailable as e:
+        raise EnvatoUpstreamError(f"browser box unavailable: {e}")
+    cookies = {c["name"]: c["value"] for c in ident.get("cookies") or []}
+    ua = ident.get("user_agent")
+    if not ua:
+        raise RuntimeError(f"the box answered without a user-agent for {host}")
+    print(f"envato: {host} identity minted on the box "
+          f"(cf_clearance={'cf_clearance' in cookies}, exit={_egress(proxy)})")
+    return cookies, ua
+
+
+def _box_candidates(ident):
+    """The browsers of `ident`'s host the box may serve this call from:
+    INPAGE_BROWSER_SLOTS x BROWSER_BURST_FACTOR sessions on the identity's
+    exit (one browser per (host, exit) until 2026-11-04). The session names
+    the browser (recipes/envato_fetch.py keys by it); the box picks an idle
+    one or opens another while it has headroom."""
+    port = urlparse(ident.proxy).port if ident.proxy else None
+    return [(ident.proxy, f"{ident.host}@p{port}#{i}")
+            for i in range(config.burst_slots(config.INPAGE_BROWSER_SLOTS))]
+
+
+def _box_fetch(ident, url, headers):
+    """In-page fetch from one of the host's kept browsers on the box
+    (recipes/envato_fetch.py, keyed by host x the identity's exit x slot)
+    -> _Resp. A BoxRefused propagates to _market_once (the exit is burned
+    for the host)."""
+    try:
+        _i, res = browser_client.fetch_any(BOX_FETCH, _box_candidates(ident), url=url, headers=headers,
+                                           variant=ident.host)
+    except BoxUnavailable as e:
+        raise EnvatoUpstreamError(f"in-page fetch failed: {e}")
+    return _Resp(int(res.get("status") or 0), res.get("body") or "", res.get("headers"),
+                 res.get("final_url") or url)
 
 
 def _curl_validates(host, cookies, ua, proxy):
@@ -334,24 +245,26 @@ def _curl_validates(host, cookies, ua, proxy):
 
 
 def _mint(host):
-    """Open the host's tab (fresh exit on failure) and pick its mode."""
+    """Mint the host's identity on the box (a fresh exit after a failure)
+    and pick its mode by a curl replay on that exit."""
     last = None
     for attempt in range(1, config.ENVATO_MARKET_HARVEST_ATTEMPTS + 1):
-        generation = _browser.generation
+        proxy = _market_proxy_url()
         try:
-            _, generation = _browser._driver()     # the browser this attempt runs on (launched if needed)
-            cookies, ua, proxy, generation = _browser.open_host(host)
+            cookies, ua = _box_mint(host, proxy)
+        except EnvatoUpstreamError:
+            raise                                   # the box is down: retried by market_request, no cooldown
         except Exception as e:
             last = e
             print(f"envato: {host} mint attempt {attempt}/{config.ENVATO_MARKET_HARVEST_ATTEMPTS} "
                   f"failed: {type(e).__name__}: {str(e).splitlines()[0][:160]}")
-            _browser.restart(generation)            # next attempt on a fresh exit
+            _market_proxy_url(rotate=True)          # next attempt on a fresh exit
             continue
         mode = "curl" if _curl_validates(host, cookies, ua, proxy) else "browser"
         print(f"envato: {host} served over {mode}")
         with _registry_lock:
             _versions[host] = _versions.get(host, 0) + 1
-            return _Identity(host, mode, cookies, ua, proxy, generation if mode == "browser" else _versions[host])
+            return _Identity(host, mode, cookies, ua, proxy, _versions[host])
     _failed_until[host] = time.time() + config.ENVATO_MARKET_HARVEST_COOLDOWN
     raise EnvatoBlocked(f"Cloudflare challenge on {host}; the browser could not open it ({last})")
 
@@ -411,29 +324,33 @@ def with_query(url, params):
 
 
 def _market_once(url, params, headers, allow_redirects):
-    """One GET with the host's identity -> response. A challenge (or a dead
-    tab) re-mints the identity once."""
+    """One GET with the host's identity -> response. A challenge (or a
+    browser-mode answer the box refused) re-mints the identity once."""
     host = urlparse(url).hostname
     url = with_query(url, params)
     for _ in range(2):
         ident = _identity(host)
         try:
             if ident.mode == "browser":
-                resp = _browser.fetch(host, url, headers, ident.version)
+                resp = _box_fetch(ident, url, headers)
             else:
                 resp = _market_session(ident).get(
                     url, headers={**headers, "user-agent": ident.ua}, cookies=ident.cookies,
                     timeout=TIMEOUT, allow_redirects=allow_redirects)
-        except _StaleBrowser:
+        except BoxRefused as e:
+            # 403/429/interstitial in the browser: the box closed that host's
+            # browser and the exit is burned for the host. Re-mint on a fresh one.
+            print(f"envato: {host} refused in the browser ({e}); re-minting on a fresh exit")
             _invalidate(ident)
+            _market_proxy_url(rotate=True)
             continue
         except EnvatoUpstreamError:
             raise
         except Exception as e:
             # A transport error usually means the sticky exit died ("CONNECT
-            # tunnel failed"): drop the identity so the retry re-opens the
-            # host's tab — on a dead exit that fails too, and _mint then
-            # relaunches Chrome on a fresh one.
+            # tunnel failed"): drop the identity so the retry re-mints the
+            # host — on a dead exit that fails too, and _mint then moves to
+            # a fresh one.
             _drop_market_session(host)
             _invalidate(ident)
             raise EnvatoUpstreamError(f"request failed: {type(e).__name__}: {e}")
@@ -555,8 +472,9 @@ def _elements_fetch(path):
         _drop_elements_session(proxy)
     if not config.ENVATO_ELEMENTS_BROWSER_FALLBACK:
         raise EnvatoBlocked(f"Cloudflare challenge on Elements {path} on every exit tried")
-    # last resort: the shared browser opens an elements.envato.com tab and the
-    # call is replayed with its clearance (or run as an in-page fetch)
+    # last resort: an elements.envato.com identity minted on the box (the
+    # Market machinery; variant "elements.envato.com") replays the call with
+    # its clearance, or runs it as an in-page fetch there
     return _market_once(DATA_API, {"path": path}, {**JSON_HEADERS, "referer": ELEMENTS + path}, True)
 
 
@@ -619,13 +537,7 @@ def _unwrap(body, label, missing):
 
 def run_parallel(fns, workers=FANOUT_WORKERS):
     """Run zero-arg callables in parallel; results align with `fns`."""
-    if not fns:
-        return []
-    if len(fns) == 1:
-        return [fns[0]()]
-    with ThreadPoolExecutor(max_workers=min(workers, len(fns))) as ex:
-        futures = [ex.submit(fn) for fn in fns]
-        return [f.result() for f in futures]
+    return fanout.per_call(fns, workers)
 
 
 if __name__ == "__main__":
